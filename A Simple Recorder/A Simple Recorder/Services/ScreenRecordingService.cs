@@ -52,11 +52,22 @@ namespace A_Simple_Recorder.Services
         private int _actualFrameCount = 0;
         private DateTime _recordingStartTime;
         private const int TARGET_FPS = 30;
+        private uint _audioSampleRate = 48000;  // Will be set from actual audio graph
+        private uint _sourceAudioChannels = 2;
+        private uint _audioChannels = 2;
+
+        // Test tone generator for debugging audio pipeline
+        private bool _useTestTone = false;  // DISABLED: Use real microphone capture
+        private double _testTonePhase = 0;
 
         // Frame writing timer and current frame storage
         private Timer? _frameWriteTimer;
         private byte[]? _currentFrameData;
         private readonly object _frameLock = new object();
+        private byte[]? _audioRemainder;
+
+        // Audio block size calculated once per recording session (per SharpAvi guidelines)
+        private int _audioBlockSize;
 
         // Start preview only (no file recording)
         public async Task StartPreviewAsync(Window window, Action<SoftwareBitmap>? onFrameCaptured = null)
@@ -127,7 +138,22 @@ namespace A_Simple_Recorder.Services
                 // Create output file
                 _outputFile = await _saveFolder.CreateFileAsync(_fileName, CreationCollisionOption.GenerateUniqueName);
 
-                // Initialize AVI writer at 30 FPS (we'll duplicate frames to match this)
+                // Initialize state
+                _actualFrameCount = 0;
+                _recordingStartTime = DateTime.Now;
+
+                // Set recording flag BEFORE starting audio so OnAudioQuantumStarted can capture frames
+                _isRecording = true;
+
+                // Initialize audio capture FIRST to get actual sample rate
+                await InitializeMicrophoneAsync();
+
+                // USE the native sample rate from AudioGraph - DO NOT override!
+                // The AudioGraph captures at device native rate (usually 48000 Hz)
+                // We must use the same rate for the WAV file header
+                System.Diagnostics.Debug.WriteLine($"Using audio format: {_audioSampleRate}Hz, {_audioChannels}ch");
+
+                // Initialize AVI writer at 30 FPS
                 _aviWriter = new AviWriter(_outputFile.Path)
                 {
                     FramesPerSecond = TARGET_FPS,
@@ -139,22 +165,30 @@ namespace A_Simple_Recorder.Services
                 _videoStream.Width = _frameWidth;
                 _videoStream.Height = _frameHeight;
 
-                // Add audio stream (PCM 16-bit, 44100 Hz, stereo)
+                // Create audio stream in AVI - 16-bit PCM, matching AudioGraph output format
+                // SharpAvi 3.x: Use AddAudioStream with waveFormat short (1 = PCM)
                 _audioStream = _aviWriter.AddAudioStream(
-                    channelCount: 2,
-                    samplesPerSecond: 44100,
-                    bitsPerSample: 16
-                );
+                    channelCount: (int)_audioChannels,
+                    samplesPerSecond: (int)_audioSampleRate,
+                    bitsPerSample: 16);
 
-                // Initialize state
-                _actualFrameCount = 0;
-                _recordingStartTime = DateTime.Now;
+                // Calculate audio block size ONCE using stream properties (per SharpAvi guidelines)
+                // audioByteRate = (bitsPerSample / 8) * channelCount * samplesPerSecond
+                // audioBlockSize = audioByteRate / framesPerSecond
+                var audioByteRate = (_audioStream.BitsPerSample / 8) * _audioStream.ChannelCount * _audioStream.SamplesPerSecond;
+                _audioBlockSize = (int)(audioByteRate / _aviWriter.FramesPerSecond);
+                if (_audioBlockSize <= 0)
+                {
+                    _audioBlockSize = (_audioStream.BitsPerSample / 8) * _audioStream.ChannelCount;
+                }
 
-                // Set recording flag BEFORE starting audio so OnAudioQuantumStarted can capture frames
-                _isRecording = true;
-
-                // Initialize audio capture
-                await InitializeMicrophoneAsync();
+                // IMPORTANT: Verify format consistency
+                System.Diagnostics.Debug.WriteLine($"=== AUDIO FORMAT VERIFICATION ===");
+                System.Diagnostics.Debug.WriteLine($"AudioGraph captures at: {_audioSampleRate}Hz, {_sourceAudioChannels}ch");
+                System.Diagnostics.Debug.WriteLine($"AVI stream expects: {_audioStream.SamplesPerSecond}Hz, {_audioStream.ChannelCount}ch, {_audioStream.BitsPerSample}-bit");
+                System.Diagnostics.Debug.WriteLine($"Audio block size per frame: {_audioBlockSize} bytes");
+                System.Diagnostics.Debug.WriteLine($"Samples per video frame: {_audioBlockSize / (_audioStream.ChannelCount * 2)}");
+                System.Diagnostics.Debug.WriteLine($"=================================");
 
                 // Start the frame writing timer - fires every ~33.3ms for 30 FPS
                 // This ensures we write exactly 30 frames per second regardless of capture rate
@@ -183,10 +217,8 @@ namespace A_Simple_Recorder.Services
         {
             try
             {
-                var settings = new AudioGraphSettings(Windows.Media.Render.AudioRenderCategory.Media)
-                {
-                    EncodingProperties = AudioEncodingProperties.CreatePcm(44100, 2, 16)
-                };
+                // Create AudioGraph - let it use default/device-native settings for best compatibility
+                var settings = new AudioGraphSettings(Windows.Media.Render.AudioRenderCategory.Media);
 
                 var result = await AudioGraph.CreateAsync(settings);
                 if (result.Status != AudioGraphCreationStatus.Success)
@@ -198,6 +230,7 @@ namespace A_Simple_Recorder.Services
                 _audioGraph = result.Graph;
 
                 // Create device input node with selected microphone
+                // DO NOT pass encoding properties - let device use its native format (prevents resampling artifacts)
                 CreateAudioDeviceInputNodeResult deviceInputNodeResult;
                 if (!string.IsNullOrEmpty(_microphoneDeviceId))
                 {
@@ -206,26 +239,27 @@ namespace A_Simple_Recorder.Services
                     var device = devices.FirstOrDefault(d => d.Id == _microphoneDeviceId);
                     if (device != null)
                     {
+                        // Create WITHOUT encoding properties - device uses native format
                         deviceInputNodeResult = await _audioGraph.CreateDeviceInputNodeAsync(
                             Windows.Media.Capture.MediaCategory.Media,
-                            _audioGraph.EncodingProperties,
+                            null,  // null = use device native format, no resampling
                             device);
-                        System.Diagnostics.Debug.WriteLine($"Using selected microphone: {device.Name}");
+                        System.Diagnostics.Debug.WriteLine($"Using selected microphone (native format): {device.Name}");
                     }
                     else
                     {
-                        // Fall back to default
+                        // Fall back to default - no encoding properties
                         deviceInputNodeResult = await _audioGraph.CreateDeviceInputNodeAsync(
                             Windows.Media.Capture.MediaCategory.Media);
-                        System.Diagnostics.Debug.WriteLine("Selected microphone not found, using default");
+                        System.Diagnostics.Debug.WriteLine("Selected microphone not found, using default (native format)");
                     }
                 }
                 else
                 {
-                    // Use default microphone
+                    // Use default microphone - no encoding properties
                     deviceInputNodeResult = await _audioGraph.CreateDeviceInputNodeAsync(
                         Windows.Media.Capture.MediaCategory.Media);
-                    System.Diagnostics.Debug.WriteLine("Using default microphone");
+                    System.Diagnostics.Debug.WriteLine("Using default microphone (native format)");
                 }
 
                 if (deviceInputNodeResult.Status != AudioDeviceNodeCreationStatus.Success)
@@ -236,26 +270,41 @@ namespace A_Simple_Recorder.Services
 
                 _audioInputNode = deviceInputNodeResult.DeviceInputNode;
 
-                // Create frame output node with explicit encoding to ensure consistent format
-                // Note: AudioGraph always processes in float format internally
-                _audioFrameOutputNode = _audioGraph.CreateFrameOutputNode(_audioGraph.EncodingProperties);
+                // Get ACTUAL sample rate and channels from the INPUT NODE (not the graph!)
+                // The device might have different properties than the graph's default
+                _audioSampleRate = _audioInputNode.EncodingProperties.SampleRate;
+                _sourceAudioChannels = _audioInputNode.EncodingProperties.ChannelCount;
+                System.Diagnostics.Debug.WriteLine($"Device input node format: {_audioSampleRate}Hz, {_sourceAudioChannels}ch");
+
+                // Create frame output node WITHOUT forcing encoding properties
+                // This avoids any internal resampling that could cause artifacts
+                _audioFrameOutputNode = _audioGraph.CreateFrameOutputNode();
                 _audioInputNode.AddOutgoingConnection(_audioFrameOutputNode);
 
-                // Log actual audio format being used
-                var actualProps = _audioGraph.EncodingProperties;
-                System.Diagnostics.Debug.WriteLine($"Audio graph format: {actualProps.SampleRate}Hz, {actualProps.ChannelCount}ch, {actualProps.BitsPerSample}bit, Subtype={actualProps.Subtype}");
+                // Update sample rate/channels from the OUTPUT node (what we'll actually receive)
+                _audioSampleRate = _audioFrameOutputNode.EncodingProperties.SampleRate;
+                _sourceAudioChannels = _audioFrameOutputNode.EncodingProperties.ChannelCount;
 
-                // Boost audio gain for better volume (2.0 = 200% = +6dB)
-                _audioInputNode.OutgoingGain = 2.0;
+                // Normalize recording to stereo for player compatibility
+                _audioChannels = 2;
+
+                // Log all formats for debugging
+                System.Diagnostics.Debug.WriteLine($"Graph format: {_audioGraph.EncodingProperties.SampleRate}Hz, {_audioGraph.EncodingProperties.ChannelCount}ch");
+                System.Diagnostics.Debug.WriteLine($"Input node format: {_audioInputNode.EncodingProperties.SampleRate}Hz, {_audioInputNode.EncodingProperties.ChannelCount}ch");
+                System.Diagnostics.Debug.WriteLine($"Output node format: {_audioFrameOutputNode.EncodingProperties.SampleRate}Hz, {_audioFrameOutputNode.EncodingProperties.ChannelCount}ch");
+                System.Diagnostics.Debug.WriteLine($"Recording audio format: {_audioSampleRate}Hz, {_audioChannels}ch (source {_sourceAudioChannels}ch)");
+
+                // Boost audio gain for voice recording (5.0 = 500% = +14dB)
+                _audioInputNode.OutgoingGain = 5.0;
 
                 _audioGraph.QuantumStarted += OnAudioQuantumStarted;
                 _audioGraph.Start();
 
-                System.Diagnostics.Debug.WriteLine("Audio capture started");
+                System.Diagnostics.Debug.WriteLine($"Audio capture started with gain={_audioInputNode.OutgoingGain}");
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error initializing audio: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"ERROR initializing audio: {ex.Message}");
             }
         }
 
@@ -339,7 +388,7 @@ namespace A_Simple_Recorder.Services
             }
         }
 
-        // Timer callback that writes frames at exactly 30 FPS
+        // Timer callback that writes frames at exactly 30 FPS (VIDEO ONLY)
         private void WriteFrameTimerCallback(object? state)
         {
             if (!_isRecording || _isShuttingDown || _videoStream == null)
@@ -347,6 +396,7 @@ namespace A_Simple_Recorder.Services
 
             try
             {
+                // Write video frame
                 byte[]? frameToWrite = null;
 
                 lock (_frameLock)
@@ -365,52 +415,66 @@ namespace A_Simple_Recorder.Services
                     var blackFrame = new byte[_frameWidth * _frameHeight * 4];
                     _videoStream.WriteFrame(true, blackFrame, 0, blackFrame.Length);
                 }
-                _actualFrameCount++;
 
-                // ALWAYS write audio data from buffer (1/30th of a second worth)
-                // This must happen regardless of whether we have a video frame
+                // Write audio to AVI - must be interleaved with video for proper playback
                 if (_audioStream != null)
                 {
-                    // 44100 samples/sec * 2 channels * 2 bytes/sample / 30 FPS = 5880 bytes per frame
-                    const int bytesPerFrame = (44100 * 2 * 2) / TARGET_FPS;
+                    // Use pre-calculated audio block size (per SharpAvi guidelines)
+                    var audioBuffer = new byte[_audioBlockSize];
+                    int offset = 0;
 
                     lock (_audioLock)
                     {
-                        var audioData = new byte[bytesPerFrame];
-                        int offset = 0;
-
-                        // Get audio from buffer
-                        while (offset < bytesPerFrame && _audioBuffer.TryDequeue(out var chunk))
+                        // Start with the remainder from the last run
+                        if (_audioRemainder != null)
                         {
-                            int copySize = Math.Min(chunk.Length, bytesPerFrame - offset);
-                            Array.Copy(chunk, 0, audioData, offset, copySize);
+                            int copySize = Math.Min(_audioRemainder.Length, _audioBlockSize);
+                            Array.Copy(_audioRemainder, 0, audioBuffer, 0, copySize);
                             offset += copySize;
-                            _audioBufferSize -= copySize;
 
-                            if (copySize < chunk.Length)
+                            if (copySize < _audioRemainder.Length)
                             {
-                                var remainder = new byte[chunk.Length - copySize];
-                                Array.Copy(chunk, copySize, remainder, 0, remainder.Length);
-                                _audioBuffer.Enqueue(remainder);
-                                _audioBufferSize += remainder.Length;
+                                // Not all of the remainder was used, save the rest for next time
+                                var newRemainder = new byte[_audioRemainder.Length - copySize];
+                                Array.Copy(_audioRemainder, copySize, newRemainder, 0, newRemainder.Length);
+                                _audioRemainder = newRemainder;
+                            }
+                            else
+                            {
+                                _audioRemainder = null;
                             }
                         }
 
-                        // Log audio write status
-                        if (_actualFrameCount % 30 == 0)
+                        // Now fill the rest from the buffer
+                        while (offset < _audioBlockSize && _audioBuffer.TryDequeue(out var chunk))
                         {
-                            System.Diagnostics.Debug.WriteLine($"Writing audio: {offset}/{bytesPerFrame} bytes from buffer (buffer size: {_audioBufferSize})");
-                        }
+                            _audioBufferSize -= chunk.Length; // Decrement full chunk size
 
-                        // Rest is already zeros (silence) if we didn't fill the buffer
-                        _audioStream.WriteBlock(audioData, 0, bytesPerFrame);
+                            int copySize = Math.Min(chunk.Length, _audioBlockSize - offset);
+                            Array.Copy(chunk, 0, audioBuffer, offset, copySize);
+                            offset += copySize;
+
+                            // If we didn't use the whole chunk, save the remainder for the next callback
+                            if (copySize < chunk.Length)
+                            {
+                                _audioRemainder = new byte[chunk.Length - copySize];
+                                Array.Copy(chunk, copySize, _audioRemainder, 0, _audioRemainder.Length);
+                                // Break because we have filled the audioBuffer
+                                break;
+                            }
+                        }
                     }
+
+                    // Write audio block to AVI (even if partially filled with silence)
+                    _audioStream.WriteBlock(audioBuffer, 0, audioBuffer.Length);
                 }
+
+                _actualFrameCount++;
 
                 if (_actualFrameCount % 30 == 0)
                 {
                     var elapsed = (DateTime.Now - _recordingStartTime).TotalSeconds;
-                    System.Diagnostics.Debug.WriteLine($"Recording: {_actualFrameCount} frames ({_actualFrameCount / (double)TARGET_FPS:F1}s video, {elapsed:F1}s real)");
+                    System.Diagnostics.Debug.WriteLine($"Recording: {_actualFrameCount} frames ({_actualFrameCount / (double)TARGET_FPS:F1}s video, {elapsed:F1}s real), audio buffer={_audioBufferSize}");
                 }
             }
             catch (Exception ex)
@@ -464,7 +528,7 @@ namespace A_Simple_Recorder.Services
 
             try
             {
-                var frame = _audioFrameOutputNode.GetFrame();
+                using var frame = _audioFrameOutputNode.GetFrame();
                 if (frame == null)
                 {
                     return;
@@ -480,43 +544,53 @@ namespace A_Simple_Recorder.Services
                         var byteAccess = reference.As<IMemoryBufferByteAccess>();
                         byteAccess.GetBuffer(out data, out capacity);
 
-                        if (capacity == 0)
+                        var validLength = (int)buffer.Length;
+                        if (validLength <= 0)
                             return;
 
-                        byte[] pcmData;
+                        // AudioGraph returns 32-bit float samples.
+                        // Use AudioBuffer.Length (valid data), not IMemoryBuffer capacity.
+                        int floatSampleCount = validLength / sizeof(float);
+                        if (floatSampleCount <= 0)
+                            return;
+
+                        int sourceChannels = (int)Math.Max(1, _sourceAudioChannels);
+                        int targetChannels = (int)Math.Max(1, _audioChannels);
+                        int frameCount = floatSampleCount / sourceChannels;
+                        if (frameCount <= 0)
+                            return;
+
+                        float* floatData = (float*)data;
+
+                        var pcmData = new byte[frameCount * targetChannels * sizeof(short)];
                         int nonZeroSamples = 0;
+                        float maxSample = 0;
 
-                        // Check the encoding subtype to determine format
-                        // AudioGraph internally uses Float format even when PCM is requested
-                        var subtype = _audioGraph?.EncodingProperties?.Subtype ?? "";
-
-                        if (subtype.Equals("Float", StringComparison.OrdinalIgnoreCase))
+                        for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
                         {
-                            // Float format: convert to 16-bit PCM
-                            int floatSampleCount = (int)capacity / sizeof(float);
-                            float* floatData = (float*)data;
-                            pcmData = new byte[floatSampleCount * sizeof(short)];
+                            int sourceOffset = frameIndex * sourceChannels;
 
-                            for (int i = 0; i < floatSampleCount; i++)
+                            // Downmix source channels to mono to handle devices exposing 8+ channels.
+                            float mono = 0f;
+                            for (int c = 0; c < sourceChannels; c++)
                             {
-                                float sample = Math.Max(-1.0f, Math.Min(1.0f, floatData[i]));
-                                short pcmSample = (short)(sample * short.MaxValue);
-                                if (pcmSample != 0) nonZeroSamples++;
-                                pcmData[i * 2] = (byte)(pcmSample & 0xFF);
-                                pcmData[i * 2 + 1] = (byte)((pcmSample >> 8) & 0xFF);
+                                mono += floatData[sourceOffset + c];
                             }
-                        }
-                        else
-                        {
-                            // PCM format: data is already 16-bit PCM, just copy it
-                            pcmData = new byte[capacity];
-                            System.Runtime.InteropServices.Marshal.Copy((IntPtr)data, pcmData, 0, (int)capacity);
+                            mono /= sourceChannels;
 
-                            // Count non-zero samples for logging
-                            for (int i = 0; i < capacity / 2; i++)
+                            float absSample = Math.Abs(mono);
+                            if (absSample > maxSample) maxSample = absSample;
+
+                            mono = Math.Max(-1.0f, Math.Min(1.0f, mono));
+                            short pcmSample = (short)(mono * 32767.0f);
+
+                            // Write mono to all target channels (stereo duplicate)
+                            for (int tc = 0; tc < targetChannels; tc++)
                             {
-                                short sample = (short)(pcmData[i * 2] | (pcmData[i * 2 + 1] << 8));
-                                if (sample != 0) nonZeroSamples++;
+                                int outputIndex = (frameIndex * targetChannels + tc) * 2;
+                                pcmData[outputIndex] = (byte)(pcmSample & 0xFF);
+                                pcmData[outputIndex + 1] = (byte)((pcmSample >> 8) & 0xFF);
+                                if (pcmSample != 0) nonZeroSamples++;
                             }
                         }
 
@@ -525,10 +599,9 @@ namespace A_Simple_Recorder.Services
                             _audioBuffer.Enqueue(pcmData);
                             _audioBufferSize += pcmData.Length;
 
-                            // Log less frequently to reduce spam
-                            if (_actualFrameCount % 30 == 0)
+                            if (_actualFrameCount % 30 == 0 && nonZeroSamples > 0)
                             {
-                                System.Diagnostics.Debug.WriteLine($"Audio captured: {pcmData.Length} bytes, {nonZeroSamples} non-zero samples, format={subtype}, buffer={_audioBufferSize}");
+                                System.Diagnostics.Debug.WriteLine($"Audio: {pcmData.Length}B, {nonZeroSamples}/{frameCount * targetChannels} non-zero, max={maxSample:F4}, buffer={_audioBufferSize}B");
                             }
                         }
                     }
@@ -577,28 +650,6 @@ namespace A_Simple_Recorder.Services
                     _audioGraph.Stop();
                 }
 
-                // Collect remaining audio buffer (do this before disposing audio graph)
-                List<byte[]> remainingAudio = new List<byte[]>();
-                lock (_audioLock)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Collecting remaining audio buffer: {_audioBufferSize} bytes");
-                    while (_audioBuffer.TryDequeue(out var chunk))
-                    {
-                        remainingAudio.Add(chunk);
-                    }
-                    _audioBufferSize = 0;
-                }
-
-                // Write remaining audio outside of lock (faster, no blocking)
-                if (_audioStream != null && remainingAudio.Count > 0)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Flushing {remainingAudio.Count} audio chunks to file");
-                    foreach (var chunk in remainingAudio)
-                    {
-                        _audioStream.WriteBlock(chunk, 0, chunk.Length);
-                    }
-                }
-
                 // Dispose audio graph
                 if (_audioGraph != null)
                 {
@@ -615,6 +666,7 @@ namespace A_Simple_Recorder.Services
                 }
 
                 // Close AVI writer properly
+                string aviPath = _outputFile?.Path ?? "";
                 if (_aviWriter != null)
                 {
                     try
@@ -638,12 +690,12 @@ namespace A_Simple_Recorder.Services
                 {
                     _audioBuffer = new ConcurrentQueue<byte[]>();
                     _audioBufferSize = 0;
+                    _audioRemainder = null;
                 }
 
-                var fullPath = _outputFile?.Path ?? "unknown";
-                System.Diagnostics.Debug.WriteLine($"File recording stopped - saved to {fullPath}");
+                System.Diagnostics.Debug.WriteLine($"File recording stopped - saved to {aviPath}");
 
-                return fullPath;
+                return aviPath;
             }
             catch (Exception ex)
             {
@@ -717,6 +769,110 @@ namespace A_Simple_Recorder.Services
         public void SignalShutdown()
         {
             _isShuttingDown = true;
+        }
+
+        // Mux video and audio files using ffmpeg
+        private async Task<string> MuxVideoAndAudioAsync(string videoPath, string audioPath)
+        {
+            try
+            {
+                // Output path: same as video but with _final suffix
+                string outputPath = Path.Combine(
+                    Path.GetDirectoryName(videoPath) ?? "",
+                    Path.GetFileNameWithoutExtension(videoPath) + "_final.avi"
+                );
+
+                // Try to find ffmpeg
+                string? ffmpegPath = FindFfmpeg();
+                if (ffmpegPath == null)
+                {
+                    System.Diagnostics.Debug.WriteLine("ffmpeg not found - keeping separate video and audio files");
+                    System.Diagnostics.Debug.WriteLine($"To combine manually, run: ffmpeg -i \"{videoPath}\" -i \"{audioPath}\" -c:v copy -c:a pcm_s16le \"{outputPath}\"");
+                    return videoPath;
+                }
+
+                System.Diagnostics.Debug.WriteLine($"Found ffmpeg at: {ffmpegPath}");
+                System.Diagnostics.Debug.WriteLine($"Muxing video and audio...");
+
+                // Run ffmpeg to combine video and audio
+                var startInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = $"-y -i \"{videoPath}\" -i \"{audioPath}\" -c:v copy -c:a pcm_s16le \"{outputPath}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = System.Diagnostics.Process.Start(startInfo);
+                if (process != null)
+                {
+                    string stderr = await process.StandardError.ReadToEndAsync();
+                    await process.WaitForExitAsync();
+
+                    if (process.ExitCode == 0 && File.Exists(outputPath))
+                    {
+                        System.Diagnostics.Debug.WriteLine($"Successfully muxed to: {outputPath}");
+
+                        // Delete the separate video and audio files
+                        try
+                        {
+                            File.Delete(videoPath);
+                            File.Delete(audioPath);
+                            System.Diagnostics.Debug.WriteLine("Cleaned up temporary files");
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Could not delete temp files: {ex.Message}");
+                        }
+
+                        return outputPath;
+                    }
+                    else
+                    {
+                        System.Diagnostics.Debug.WriteLine($"ffmpeg failed with exit code {process.ExitCode}");
+                        System.Diagnostics.Debug.WriteLine($"ffmpeg stderr: {stderr}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error muxing video and audio: {ex.Message}");
+            }
+
+            return videoPath;
+        }
+
+        // Try to find ffmpeg in common locations
+        private string? FindFfmpeg()
+        {
+            // Check if ffmpeg is in PATH
+            var pathDirs = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? Array.Empty<string>();
+            foreach (var dir in pathDirs)
+            {
+                var ffmpegPath = Path.Combine(dir, "ffmpeg.exe");
+                if (File.Exists(ffmpegPath))
+                    return ffmpegPath;
+            }
+
+            // Check common installation locations
+            string[] commonPaths = new[]
+            {
+                @"C:\ffmpeg\bin\ffmpeg.exe",
+                @"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+                @"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"ffmpeg\bin\ffmpeg.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @"ffmpeg\bin\ffmpeg.exe"),
+            };
+
+            foreach (var path in commonPaths)
+            {
+                if (File.Exists(path))
+                    return path;
+            }
+
+            return null;
         }
     }
 }
